@@ -29,12 +29,12 @@ interface Task {
 }
 
 // =============================================
-// Step 3: Tab types for bottom navigation
+// Tab types for bottom navigation
 // =============================================
 type TabType = 'home' | 'processing' | 'completed' | 'failed' | 'history';
 
 // =============================================
-// Step 3: 12-hour time format helper
+// 12-hour time format helper
 // =============================================
 function formatTime12h(isoString: string): string {
   try {
@@ -53,7 +53,7 @@ function formatTime12h(isoString: string): string {
 }
 
 // =============================================
-// Step 2: Link stats calculator
+// Link stats calculator (used for non-streaming tasks)
 // =============================================
 function getLinkStats(links: any[]): { total: number; done: number; failed: number; pending: number } {
   if (!links || links.length === 0) return { total: 0, done: 0, failed: 0, pending: 0 };
@@ -76,7 +76,7 @@ export default function MflixApp() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [expandedTask, setExpandedTask] = useState<string | null>(null);
 
-  // Step 3: Active tab state
+  // Active tab state
   const [activeTab, setActiveTab] = useState<TabType>('home');
 
   // Live stream state
@@ -85,7 +85,7 @@ export default function MflixApp() {
   const [liveLinks, setLiveLinks] = useState<Record<number, string | null>>({});
   const [liveStatuses, setLiveStatuses] = useState<Record<number, string>>({});
 
-  // Step 4: Deleting / Retrying state
+  // Deleting / Retrying state
   const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null);
 
@@ -100,6 +100,13 @@ export default function MflixApp() {
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
+  // ==========================================================================
+  // BUG B FIX: fetchTasks now PROTECTS live-streaming task data from being
+  // overwritten by stale Firestore data. During an active stream, the task
+  // for that stream is NOT replaced by Firestore data — only non-streaming
+  // tasks get updated. This prevents "ghost reversions" where completed links
+  // randomly revert to "Queued for processing..." or "Processing...".
+  // ==========================================================================
   const fetchTasks = async () => {
     try {
       const res = await fetch('/api/tasks');
@@ -112,12 +119,71 @@ export default function MflixApp() {
       if (!contentType || !contentType.includes("application/json")) return;
       const data = await res.json();
       if (Array.isArray(data)) {
-        setTasks(data);
+        setTasks(prevTasks => {
+          // Read from the ref to know which tasks are currently streaming.
+          // This avoids stale closure issues with activeTaskId state.
+          const currentlyStreamingIds = streamStartedRef.current;
+
+          if (currentlyStreamingIds.size === 0) {
+            // No active streams — safe to replace everything with fresh Firestore data
+            return data;
+          }
+
+          // Merge strategy: for streaming tasks, keep the previous local state;
+          // for everything else, use fresh Firestore data.
+          return data.map((serverTask: Task) => {
+            if (currentlyStreamingIds.has(serverTask.id)) {
+              // Find the existing local task to preserve its state
+              const localTask = prevTasks.find(t => t.id === serverTask.id);
+              if (localTask) {
+                return localTask; // Keep local state — don't overwrite with stale Firestore
+              }
+            }
+            return serverTask; // Use fresh Firestore data for non-streaming tasks
+          });
+        });
       }
     } catch (e) {
       console.error('Failed to fetch tasks:', e);
     }
   };
+
+  // ==========================================================================
+  // BUG A FIX: getEffectiveStats computes counter values from the LIVE
+  // liveStatuses state during streaming, instead of from the stale task.links
+  // array. This means the 4 counter badges (Total, Done, Failed, Pending)
+  // update in real-time as each SSE event comes in.
+  // ==========================================================================
+  const getEffectiveStats = useCallback((task: Task): { total: number; done: number; failed: number; pending: number } => {
+    const isLive = activeTaskId === task.id;
+
+    if (!isLive) {
+      // Not streaming — use Firestore data as-is
+      return getLinkStats(task.links);
+    }
+
+    // Streaming: build stats from liveStatuses for ALL link indices
+    const total = task.links.length;
+    let done = 0, failed = 0, pending = 0;
+
+    for (let i = 0; i < total; i++) {
+      const liveStatus = liveStatuses[i];
+      if (liveStatus) {
+        const s = liveStatus.toLowerCase();
+        if (s === 'done' || s === 'success') done++;
+        else if (s === 'error' || s === 'failed') failed++;
+        else pending++; // 'processing' etc.
+      } else {
+        // No live status for this index — check the original link status
+        const origStatus = (task.links[i]?.status || '').toLowerCase();
+        if (origStatus === 'done' || origStatus === 'success') done++;
+        else if (origStatus === 'error' || origStatus === 'failed') failed++;
+        else pending++;
+      }
+    }
+
+    return { total, done, failed, pending };
+  }, [activeTaskId, liveStatuses]);
 
   /**
    * Stream the solving process in real-time via SSE (NDJSON)
@@ -127,6 +193,8 @@ export default function MflixApp() {
    * 2. Uses streamStartedRef to prevent duplicate streams
    * 3. Properly handles all link states in the UI during streaming
    * 4. Cleanup in finally block ensures state is always reset
+   * 5. BUG A FIX: Each SSE event updates liveStatuses so counters react in real-time
+   * 6. BUG B FIX: streamStartedRef blocks fetchTasks from overwriting streaming task
    */
   const startLiveStream = useCallback(async (taskId: string, links: any[]) => {
     // Guard: Don't start if already streaming this task
@@ -135,7 +203,7 @@ export default function MflixApp() {
       return;
     }
 
-    // FIX #1: Only process links that are actually pending
+    // Only process links that are actually pending
     const pendingLinks = links
       .map((l: any, idx: number) => ({ ...l, _originalIdx: idx }))
       .filter((l: any) => {
@@ -179,7 +247,7 @@ export default function MflixApp() {
     setLiveStatuses(initialStatuses);
 
     try {
-      // FIX #2: Send pending links with their ORIGINAL index so the UI maps correctly
+      // Send pending links with their ORIGINAL index so the UI maps correctly
       const linksToSend = pendingLinks.map((l: any) => ({
         id: l._originalIdx,
         name: l.name,
@@ -233,6 +301,10 @@ export default function MflixApp() {
             const data = JSON.parse(line);
             const lid = data.id;
 
+            // =================================================================
+            // BUG A FIX: Always accumulate logs — never replace previous logs.
+            // Using functional updater to avoid stale closure issues.
+            // =================================================================
             if (data.msg && data.type) {
               setLiveLogs(prev => ({
                 ...prev,
@@ -244,11 +316,29 @@ export default function MflixApp() {
               setLiveLinks(prev => ({ ...prev, [lid]: data.final }));
             }
 
-            if (data.status === 'done' || data.status === 'error' || data.status === 'finished') {
+            // =================================================================
+            // BUG A FIX: Update liveStatuses on TERMINAL events ('done'/'error').
+            // getEffectiveStats reads from liveStatuses, so the counter badges
+            // will automatically re-render when this state changes.
+            // =================================================================
+            if (data.status === 'done' || data.status === 'error') {
               setLiveStatuses(prev => ({
                 ...prev,
-                [lid]: data.status === 'finished' ? (prev[lid] === 'done' ? 'done' : 'error') : data.status
+                [lid]: data.status
               }));
+            }
+
+            // 'finished' means the link processing is complete —
+            // if we haven't set done/error yet, mark as error (safety net)
+            if (data.status === 'finished') {
+              setLiveStatuses(prev => {
+                const currentStatus = prev[lid];
+                // Only update if not already in a terminal state
+                if (currentStatus !== 'done' && currentStatus !== 'error') {
+                  return { ...prev, [lid]: 'error' };
+                }
+                return prev;
+              });
             }
           } catch {
             // skip invalid JSON lines
@@ -258,8 +348,9 @@ export default function MflixApp() {
     } catch (e: any) {
       console.error('[Stream] Stream error:', e);
     } finally {
-      // FIX #3: Always cleanup in finally block
+      // Always cleanup in finally block
       streamStartedRef.current.delete(taskId);
+      // Fetch fresh Firestore data now that stream is done & data has been persisted
       setTimeout(fetchTasks, 2000);
       setActiveTaskId(null);
     }
@@ -309,14 +400,8 @@ export default function MflixApp() {
         setExpandedTask(data.taskId);
         setActiveTab('processing');
 
-        // ============================================================
-        // FIX (PRIMARY BUG): ALWAYS try to start stream for any task
-        // that has pending links. The old code had:
-        //   if (!data.merged || data.newLinksAdded > 0)
-        // This broke retry (merged=true, newLinksAdded=0 but links
-        // were reset to 'pending'). Now we just check for pending links.
+        // Always try to start stream for any task that has pending links.
         // startLiveStream itself will skip if no pending links exist.
-        // ============================================================
         try {
           const taskRes = await fetch('/api/tasks');
           const taskResContentType = taskRes.headers.get("content-type");
@@ -325,7 +410,6 @@ export default function MflixApp() {
             const newTask = taskList.find((t: any) => t.id === data.taskId);
 
             if (newTask && newTask.links && newTask.links.length > 0) {
-              // FIX: AWAIT the stream so we don't race ahead
               await startLiveStream(data.taskId, newTask.links);
             }
           }
@@ -348,7 +432,7 @@ export default function MflixApp() {
   };
 
   // =============================================
-  // Step 4: Delete a task
+  // Delete a task
   // =============================================
   const handleDeleteTask = async (taskId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -378,7 +462,7 @@ export default function MflixApp() {
   };
 
   // =============================================
-  // Step 4: Retry a failed task
+  // Retry a failed task
   // =============================================
   const handleRetryTask = async (task: Task, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -411,7 +495,6 @@ export default function MflixApp() {
         setExpandedTask(data.taskId);
         setActiveTab('processing');
 
-        // FIX: Always try to stream — don't gate on merged/newLinksAdded
         try {
           const taskRes = await fetch('/api/tasks');
           const taskResContentType = taskRes.headers.get("content-type");
@@ -447,7 +530,7 @@ export default function MflixApp() {
   };
 
   // =============================================
-  // Step 3: Filter tasks based on active tab
+  // Filter tasks based on active tab
   // =============================================
   const getFilteredTasks = (): Task[] => {
     switch (activeTab) {
@@ -588,7 +671,12 @@ export default function MflixApp() {
       {/* Tasks List */}
       <div className="space-y-4">
         {filteredTasks.map((task) => {
-          const stats = getLinkStats(task.links);
+          // ===============================================================
+          // BUG A FIX: Use getEffectiveStats instead of getLinkStats.
+          // This reads from liveStatuses during streaming, so counters
+          // update in real-time as SSE events arrive.
+          // ===============================================================
+          const stats = getEffectiveStats(task);
           return (
             <div key={task.id} className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden transition-all hover:bg-white/[0.07]">
               <div
@@ -652,7 +740,7 @@ export default function MflixApp() {
                   </div>
                 </div>
 
-                {/* Step 4: Action buttons */}
+                {/* Action buttons */}
                 <div className="flex items-center gap-1.5 flex-shrink-0">
                   {task.status === 'failed' && (
                     <button
@@ -710,7 +798,34 @@ export default function MflixApp() {
                     )}
 
                     <div className="p-4">
-                      {/* Metadata Boxes */}
+                      {/* =============================================
+                          MISSION 2 FIX: 4 Counter badges are now ABOVE
+                          the 3 metadata boxes. Order swapped.
+                          ============================================= */}
+
+                      {/* Counter Badges — MOVED ABOVE metadata */}
+                      {stats.total > 0 && (
+                        <div className="grid grid-cols-4 gap-2 mb-4">
+                          <div className="bg-slate-800/50 border border-white/5 rounded-lg p-2 text-center">
+                            <p className="text-[10px] uppercase text-slate-500 font-bold">Total</p>
+                            <p className="text-lg font-bold text-white">{stats.total}</p>
+                          </div>
+                          <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-lg p-2 text-center">
+                            <p className="text-[10px] uppercase text-emerald-500 font-bold">Done</p>
+                            <p className="text-lg font-bold text-emerald-400">{stats.done}</p>
+                          </div>
+                          <div className="bg-rose-500/5 border border-rose-500/10 rounded-lg p-2 text-center">
+                            <p className="text-[10px] uppercase text-rose-500 font-bold">Failed</p>
+                            <p className="text-lg font-bold text-rose-400">{stats.failed}</p>
+                          </div>
+                          <div className="bg-amber-500/5 border border-amber-500/10 rounded-lg p-2 text-center">
+                            <p className="text-[10px] uppercase text-amber-500 font-bold">Pending</p>
+                            <p className="text-lg font-bold text-amber-400">{stats.pending}</p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Metadata Boxes — NOW BELOW counter badges */}
                       {task.metadata && (
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
                           <div className="bg-white/5 border border-white/10 rounded-xl p-3">
@@ -733,28 +848,6 @@ export default function MflixApp() {
                               Audio Label
                             </label>
                             <p className="text-sm font-bold text-amber-400">{task.metadata.audioLabel || 'Unknown'}</p>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Step 2: Detailed Link Stats Summary */}
-                      {stats.total > 0 && (
-                        <div className="grid grid-cols-4 gap-2 mb-4">
-                          <div className="bg-slate-800/50 border border-white/5 rounded-lg p-2 text-center">
-                            <p className="text-[10px] uppercase text-slate-500 font-bold">Total</p>
-                            <p className="text-lg font-bold text-white">{stats.total}</p>
-                          </div>
-                          <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-lg p-2 text-center">
-                            <p className="text-[10px] uppercase text-emerald-500 font-bold">Done</p>
-                            <p className="text-lg font-bold text-emerald-400">{stats.done}</p>
-                          </div>
-                          <div className="bg-rose-500/5 border border-rose-500/10 rounded-lg p-2 text-center">
-                            <p className="text-[10px] uppercase text-rose-500 font-bold">Failed</p>
-                            <p className="text-lg font-bold text-rose-400">{stats.failed}</p>
-                          </div>
-                          <div className="bg-amber-500/5 border border-amber-500/10 rounded-lg p-2 text-center">
-                            <p className="text-[10px] uppercase text-amber-500 font-bold">Pending</p>
-                            <p className="text-lg font-bold text-amber-400">{stats.pending}</p>
                           </div>
                         </div>
                       )}
@@ -829,7 +922,7 @@ export default function MflixApp() {
       </div>
 
       {/* =============================================
-          Step 3: Fixed Bottom Navigation Bar
+          Fixed Bottom Navigation Bar
           ============================================= */}
       <nav className="fixed bottom-0 left-0 right-0 z-50 bg-black/80 backdrop-blur-xl border-t border-white/10 safe-area-inset-bottom">
         <div className="max-w-2xl mx-auto flex items-stretch justify-around">
