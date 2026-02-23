@@ -35,10 +35,6 @@ export async function solveHBLinks(url: string) {
   }
 }
 
-/**
- * Junk link text patterns to filter out - case insensitive matching
- * Includes fake resolution/codec buttons that redirect to ads
- */
 const JUNK_LINK_TEXTS = [
   "how to download",
   "[how to download]",
@@ -47,42 +43,27 @@ const JUNK_LINK_TEXTS = [
   "join telegram",
   "join our telegram",
   "request movie",
-  // Step 1 Fix: Fake resolution/codec ad buttons
   "4k | sdr | hevc",
   "4k | sdr",
   "sdr | hevc",
 ];
 
-/**
- * Exact-match junk texts — standalone fake button labels (case-insensitive).
- * These are filtered by exact match (after trim + lowercase) to avoid 
- * accidentally blocking legitimate links that contain "4K" in longer text like "480p/720p/1080p/4K".
- */
 const JUNK_LINK_EXACT_TEXTS = [
   "4k",
   "sdr",
   "hevc",
 ];
 
-/**
- * Checks if a link's text or nearby text is a junk/tutorial link
- */
 function isJunkLink(text: string): boolean {
   const lower = text.toLowerCase().trim();
-  // Partial/includes match
   if (JUNK_LINK_TEXTS.some(junk => lower.includes(junk))) return true;
-  // Exact match for standalone fake buttons
   if (JUNK_LINK_EXACT_TEXTS.some(junk => lower === junk)) return true;
   return false;
 }
 
-/**
- * Extract movie preview info: title + poster image
- */
 export function extractMoviePreview(html: string): { title: string; posterUrl: string | null } {
   const $ = cheerio.load(html);
 
-  // Title: Try <h1> first, then og:title, then <title>
   let title = '';
   const h1 = $('h1.entry-title, h1.post-title, h1').first().text().trim();
   if (h1) {
@@ -91,10 +72,8 @@ export function extractMoviePreview(html: string): { title: string; posterUrl: s
     const ogTitle = $('meta[property="og:title"]').attr('content') || '';
     title = ogTitle || $('title').text().trim() || 'Unknown Movie';
   }
-  // Clean title - remove site name suffixes
-  title = title.replace(/\s*[-–|].*?(HDHub|HdHub|hdhub|Download|Free).*$/i, '').trim();
+  title = title.replace(/\s*[-\u2013|].*?(HDHub|HdHub|hdhub|Download|Free).*$/i, '').trim();
 
-  // Poster: Try og:image, then first big image in entry-content
   let posterUrl: string | null = null;
   const ogImage = $('meta[property="og:image"]').attr('content');
   if (ogImage && !ogImage.includes('logo') && !ogImage.includes('favicon')) {
@@ -109,10 +88,6 @@ export function extractMoviePreview(html: string): { title: string; posterUrl: s
   return { title, posterUrl };
 }
 
-/**
- * Native Node.js implementation of the movie link extractor.
- * With strict junk link filter for "[How To Download]" etc.
- */
 export async function extractMovieLinks(url: string) {
   const HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -127,45 +102,33 @@ export async function extractMovieLinks(url: string) {
     const $ = cheerio.load(html);
 
     const foundLinks: { name: string; link: string }[] = [];
-    
-    // Extract Metadata using enhanced Python-ported function
     const metadata = extractMovieMetadata(html);
-    
-    // Extract movie preview (title + poster)
     const preview = extractMoviePreview(html);
 
-    // Optimized Extraction: Target download-related elements directly
     $('.entry-content a[href], main a[href]').each((_idx: number, el: any) => {
       const $a = $(el);
       const link = $a.attr('href') || '';
       const text = $a.text().trim();
       
-      // Filter out junk domains immediately
       if (!link || link.startsWith('#') || JUNK_DOMAINS.some(junk => link.includes(junk))) return;
-      
-      // ===== STRICT JUNK LINK FILTER =====
-      // Check the link text itself
       if (isJunkLink(text)) return;
       
-      // Check parent element text for junk patterns
       const $parent = $a.closest('p, div, h3, h4');
       const parentText = $parent.text().trim();
       if (isJunkLink(parentText)) return;
       
-      // Check for known solver domains or download keywords
       const isTargetDomain = ["hblinks", "hubdrive", "hubcdn", "hubcloud", "gdflix", "drivehub"].some(d => link.includes(d));
       const isDownloadText = ["DOWNLOAD", "720P", "480P", "1080P", "4K", "DIRECT", "GDRIVE"].some(t => text.toUpperCase().includes(t));
 
       if (isTargetDomain || isDownloadText) {
         if (!foundLinks.some(x => x.link === link)) {
-          let cleanName = text.replace(/⚡/g, "").trim();
+          let cleanName = text.replace(/\u26A1/g, "").trim();
           if (!cleanName || cleanName.length < 2) {
             const parent = $a.closest('p, div, h3, h4');
             const prev = parent.prev('h3, h4, h5, strong');
             cleanName = prev.text().trim() || parent.text().trim() || "Download Link";
           }
           
-          // Double-check the resolved name isn't junk either
           if (!isJunkLink(cleanName)) {
             foundLinks.push({ name: cleanName.substring(0, 50), link: link });
           }
@@ -190,18 +153,6 @@ export async function extractMovieLinks(url: string) {
   }
 }
 
-/**
- * ============================================================
- * ENHANCED Movie Metadata Extractor
- * Ported from Python script with 6-step extraction strategy:
- * - Step 1: Find main content area
- * - Step 2: Find DOWNLOAD LINKS section
- * - Step 3: Extract from download button labels
- * - Step 4: Check for MULTi audio line
- * - Step 5: Fallback Language: field
- * - Step 6: Quality fallback from description
- * ============================================================
- */
 export function extractMovieMetadata(html: string): {
   quality: string;
   languages: string;
@@ -218,49 +169,34 @@ export function extractMovieMetadata(html: string): {
   const foundLanguages = new Set<string>();
   const qualityInfo = { resolution: '', format: '' };
 
-  // Format priority scores (higher = better)
   const formatPriority: Record<string, number> = {
-    'WEB-DL': 5,
-    'BluRay': 4,
-    'WEBRip': 3,
-    'HEVC': 2,
-    'x264': 1,
-    'HDTC': 0,
-    '10Bit': 0
+    'WEB-DL': 5, 'BluRay': 4, 'WEBRip': 3, 'HEVC': 2, 'x264': 1, 'HDTC': 0, '10Bit': 0
   };
 
-  // ===== STEP 1: Find the main content area =====
-  // FIXED TYPE ERROR HERE BY ADDING `: any`
   let $mainContent: any = $('main.page-body');
   if ($mainContent.length === 0) $mainContent = $('div.entry-content');
   if ($mainContent.length === 0) $mainContent = $.root();
 
-  // ===== STEP 2: Look for the "DOWNLOAD LINKS" section =====
   let $downloadSection: ReturnType<typeof $> | null = null;
   $mainContent.find('h2, h3, h4').each((_i: number, heading: any) => {
     const headingText = $(heading).text().toUpperCase();
     if (headingText.includes('DOWNLOAD LINKS')) {
       $downloadSection = $(heading).parent();
-      return false; // break
+      return false;
     }
   });
   if (!$downloadSection) $downloadSection = $mainContent;
 
-  // ===== STEP 3: Extract from download button labels =====
   const downloadLinks = ($downloadSection as ReturnType<typeof $>).find('a[href]');
 
   downloadLinks.each((_i, el) => {
     const href = $(el).attr('href') || '';
-
-    // Only process actual download links (known CDN domains)
     const cdnDomains = ['hubcdn', 'hubdrive', 'gadgetsweb', 'hubstream', 'hdstream', 'hblinks', 'hubcloud', 'gdflix', 'drivehub'];
     if (!cdnDomains.some(d => href.toLowerCase().includes(d))) return;
 
-    // Get the parent heading/element text which contains quality + language
     const $parent = $(el).closest('h3, h4, p');
     const buttonLabel = $parent.length ? $parent.text().trim() : $(el).text().trim();
 
-    // Extract languages
     for (const lang of validLangs) {
       const regex = new RegExp(`\\b${lang}\\b`, 'i');
       if (regex.test(buttonLabel)) {
@@ -268,7 +204,6 @@ export function extractMovieMetadata(html: string): {
       }
     }
 
-    // Extract quality - highest resolution wins
     const qualityMatch = buttonLabel.match(/(480p|720p|1080p|2160p|4K)/i);
     if (qualityMatch) {
       const res = qualityMatch[1].toUpperCase();
@@ -279,14 +214,9 @@ export function extractMovieMetadata(html: string): {
       }
     }
 
-    // Extract format with priority
     const formatPatterns: [RegExp, string][] = [
-      [/WEB-DL/i, 'WEB-DL'],
-      [/BLURAY|BLU-RAY/i, 'BluRay'],
-      [/WEBRIP|WEB-RIP/i, 'WEBRip'],
-      [/HDTC|HD-TC/i, 'HDTC'],
-      [/HEVC|H\.265|x265/i, 'HEVC'],
-      [/x264|H\.264/i, 'x264'],
+      [/WEB-DL/i, 'WEB-DL'], [/BLURAY|BLU-RAY/i, 'BluRay'], [/WEBRIP|WEB-RIP/i, 'WEBRip'],
+      [/HDTC|HD-TC/i, 'HDTC'], [/HEVC|H\.265|x265/i, 'HEVC'], [/x264|H\.264/i, 'x264'],
       [/10[- ]?Bit/i, '10Bit'],
     ];
 
@@ -302,8 +232,6 @@ export function extractMovieMetadata(html: string): {
     }
   });
 
-  // ===== STEP 4: Check for MULTi audio line =====
-  // FIXED TYPE ERROR HERE BY CHANGING REGEX FLAG
   const pageText = ($downloadSection as ReturnType<typeof $>).text();
   const multiMatch = pageText.match(/MULTi[\s\S]*?\[([\s\S]*?HINDI[\s\S]*?)\]/i);
   if (multiMatch) {
@@ -316,7 +244,6 @@ export function extractMovieMetadata(html: string): {
     }
   }
 
-  // ===== STEP 5: Fallback - Check Language: field in description =====
   if (foundLanguages.size === 0) {
     $mainContent.find('div, span, p').each((_i: number, elem: any) => {
       const text = $(elem).text();
@@ -329,12 +256,11 @@ export function extractMovieMetadata(html: string): {
             foundLanguages.add(lang);
           }
         }
-        return false; // break
+        return false;
       }
     });
   }
 
-  // ===== STEP 6: Quality fallback from description =====
   if (!qualityInfo.resolution) {
     $mainContent.find('div, span, p').each((_i: number, elem: any) => {
       const text = $(elem).text();
@@ -342,21 +268,14 @@ export function extractMovieMetadata(html: string): {
         const qualityMatch = text.match(/Quality\s*:(.+?)(?:\n|$)/i);
         if (qualityMatch) {
           const qualityLine = qualityMatch[1];
-
           const resMatch = qualityLine.match(/(480p|720p|1080p|2160p|4K)/i);
           if (resMatch) {
             qualityInfo.resolution = resMatch[1].toUpperCase();
           }
-
           const fallbackFormatPatterns: [RegExp, string][] = [
-            [/WEB-DL/i, 'WEB-DL'],
-            [/BLURAY|BLU-RAY/i, 'BluRay'],
-            [/WEBRIP|WEB-RIP/i, 'WEBRip'],
-            [/HDTC|HD-TC/i, 'HDTC'],
-            [/HEVC|H\.265|x265/i, 'HEVC'],
-            [/x264|H\.264/i, 'x264'],
+            [/WEB-DL/i, 'WEB-DL'], [/BLURAY|BLU-RAY/i, 'BluRay'], [/WEBRIP|WEB-RIP/i, 'WEBRip'],
+            [/HDTC|HD-TC/i, 'HDTC'], [/HEVC|H\.265|x265/i, 'HEVC'], [/x264|H\.264/i, 'x264'],
           ];
-
           for (const [pattern, formatName] of fallbackFormatPatterns) {
             if (pattern.test(qualityLine)) {
               qualityInfo.format = formatName;
@@ -364,25 +283,19 @@ export function extractMovieMetadata(html: string): {
             }
           }
         }
-        return false; // break
+        return false;
       }
     });
   }
 
-  // ===== Audio Label Logic =====
   const langList = Array.from(foundLanguages).sort();
   const count = langList.length;
 
   let audioLabel = 'Not Found';
-  if (count === 1) {
-    audioLabel = langList[0];
-  } else if (count === 2) {
-    audioLabel = 'Dual Audio';
-  } else if (count >= 3) {
-    audioLabel = 'Multi Audio';
-  }
+  if (count === 1) audioLabel = langList[0];
+  else if (count === 2) audioLabel = 'Dual Audio';
+  else if (count >= 3) audioLabel = 'Multi Audio';
 
-  // Build final quality string
   let finalQuality = 'Unknown Quality';
   if (qualityInfo.resolution) {
     finalQuality = `${qualityInfo.resolution} ${qualityInfo.format}`.trim();
@@ -395,9 +308,6 @@ export function extractMovieMetadata(html: string): {
   };
 }
 
-/**
- * Native Node.js implementation of HubCDN Bypass.
- */
 export async function solveHubCDN(url: string) {
   const headers = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -445,9 +355,6 @@ export async function solveHubCDN(url: string) {
   }
 }
 
-/**
- * Native Node.js implementation of HubDrive solver.
- */
 export async function solveHubDrive(url: string) {
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -491,4 +398,171 @@ export async function solveHubDrive(url: string) {
   } catch (e: any) {
     return { status: "error", message: e.message };
   }
-} 
+}
+
+// =============================================================================
+// MISSION 3 — TASK A: NATIVE HUBCLOUD SOLVER
+// Translated from Python Flask script. Replaces the external API_MAP.hubcloud.
+// Uses axios + regex (matching Python's approach) for reliable extraction.
+// =============================================================================
+
+interface HubCloudButton {
+  button_name: string;
+  download_link: string;
+}
+
+export interface HubCloudNativeResult {
+  status: 'success' | 'error';
+  best_button_name?: string;
+  best_download_link?: string;
+  all_available_buttons?: HubCloudButton[];
+  message?: string;
+}
+
+/**
+ * Native Node.js/Cheerio HubCloud bypass — direct translation of Python script.
+ *
+ * Steps:
+ *  1. Fetch the initial HubCloud page
+ *  2. Look for intermediate redirect link (id="download", var url, hubcloud.php)
+ *  3. Follow the intermediate link to get the final page
+ *  4. Extract all <a> tags with download buttons from the final page
+ *  5. Apply priority: FSL Server (non-v2) > FSLv2/any token link > first link
+ *
+ * Returns the exact shape required by Mission 3 Task B.
+ */
+export async function solveHubCloudNative(url: string): Promise<HubCloudNativeResult> {
+  try {
+    // Clean and fix the URL (ported from Python: unquote + strip + http fix)
+    let cleanUrl = decodeURIComponent(url).trim();
+    const httpIdx = cleanUrl.indexOf('http');
+    if (httpIdx > 0) {
+      cleanUrl = cleanUrl.substring(httpIdx);
+    }
+
+    console.log(`[HubCloud Native] Processing: ${cleanUrl}`);
+
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+      "Referer": "https://hdhub4u.fo/"
+    };
+
+    // Step 1: Get the initial page
+    const resp = await axios.get(cleanUrl, {
+      headers,
+      timeout: 30000,
+      maxRedirects: 5,
+      validateStatus: (status: number) => status < 400,
+    });
+
+    let finalHtml: string = resp.data;
+
+    // Step 2: Find Intermediate Link (if exists)
+    const pattern1 = /id="download"[^>]*href="([^"]+)"/;
+    const pattern2 = /var url = '([^']+)'/;
+    const pattern3 = /href="([^"]+hubcloud\.php\?[^"]+)"/;
+
+    const intermediateMatch = pattern1.exec(resp.data) || pattern2.exec(resp.data) || pattern3.exec(resp.data);
+
+    if (intermediateMatch) {
+      const intermediateLink = intermediateMatch[1].replace(/&amp;/g, '&');
+      console.log('[HubCloud Native] Found intermediate link, redirecting...');
+
+      // Step 3: Get Final Page
+      try {
+        const finalResp = await axios.get(intermediateLink, {
+          headers,
+          timeout: 30000,
+          maxRedirects: 10,
+          validateStatus: (status: number) => status < 400,
+        });
+        finalHtml = finalResp.data;
+      } catch (intermediateErr: any) {
+        console.warn(`[HubCloud Native] Intermediate link failed: ${intermediateErr.message}, using initial page`);
+      }
+    }
+
+    // Step 4: Extract Direct Links and Button Names
+    // Using regex to match all <a> tags — same approach as the Python script
+    const rawLinkRegex = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const allExtractedLinks: HubCloudButton[] = [];
+
+    let regexMatch: RegExpExecArray | null;
+    while ((regexMatch = rawLinkRegex.exec(finalHtml)) !== null) {
+      const href = regexMatch[1];
+      const innerHTML = regexMatch[2];
+
+      // Strip HTML tags to get clean button text
+      let cleanName = innerHTML.replace(/<[^>]+>/g, '').trim();
+      // Collapse multiple spaces
+      cleanName = cleanName.replace(/\s+/g, ' ');
+
+      // Skip empty, Telegram, Android App links (matching Python logic)
+      if (!cleanName) continue;
+      if (cleanName.toLowerCase().includes('telegram')) continue;
+      if (cleanName.toLowerCase().includes('android app')) continue;
+
+      // Only include links with "token=" in href OR "server"/"download" in button name
+      const hasToken = href.includes('token=');
+      const hasServer = cleanName.toLowerCase().includes('server');
+      const hasDownload = cleanName.toLowerCase().includes('download');
+
+      if (hasToken || hasServer || hasDownload) {
+        allExtractedLinks.push({
+          button_name: cleanName,
+          download_link: href,
+        });
+      }
+    }
+
+    if (allExtractedLinks.length === 0) {
+      return {
+        status: 'error',
+        message: 'No valid download button found on the page.',
+      };
+    }
+
+    // Step 5: Priority Logic (exact translation from Python)
+    let bestLink: string | null = null;
+    let bestButtonName: string | null = null;
+
+    // Priority 1: "FSL Server" (non-v2)
+    for (const item of allExtractedLinks) {
+      if (item.button_name.includes('FSL Server') && !item.button_name.includes('v2')) {
+        bestLink = item.download_link;
+        bestButtonName = item.button_name;
+        break;
+      }
+    }
+
+    // Priority 2: FSLv2 or any token/Server link
+    if (!bestLink) {
+      for (const item of allExtractedLinks) {
+        if (item.download_link.includes('token=') || item.button_name.includes('Server')) {
+          bestLink = item.download_link;
+          bestButtonName = item.button_name;
+          break;
+        }
+      }
+    }
+
+    // Priority 3: Fallback to first link
+    if (!bestLink && allExtractedLinks.length > 0) {
+      bestLink = allExtractedLinks[0].download_link;
+      bestButtonName = allExtractedLinks[0].button_name;
+    }
+
+    return {
+      status: 'success',
+      best_button_name: bestButtonName || undefined,
+      best_download_link: bestLink || undefined,
+      all_available_buttons: allExtractedLinks,
+    };
+
+  } catch (e: any) {
+    return {
+      status: 'error',
+      message: e.message,
+    };
+  }
+}
